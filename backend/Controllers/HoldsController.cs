@@ -9,8 +9,6 @@ namespace backend.Controllers;
 public class HoldsController : ControllerBase
 {
     private readonly AppDbContext _context;
-    // Static lock object to prevent concurrent requests from overbooking
-    private static readonly object _lock = new object();
     private readonly int _holdDurationSeconds;
 
     public HoldsController(AppDbContext context, IConfiguration config)
@@ -25,13 +23,19 @@ public class HoldsController : ControllerBase
     {
         if (string.IsNullOrEmpty(studentId)) return BadRequest(new { message = "X-Student-Id header is required." });
 
-        // Use lock to ensure thread safety (only one request at a time)
-        lock (_lock)
+        // Use database transaction to prevent overbooking across multiple processes
+        using var transaction = await _context.Database.BeginTransactionAsync();
+        try
         {
-            var c = _context.Classes.Include(x => x.Holds).FirstOrDefault(x => x.Id == classId);
+            // Lock the Class row so no other process can read it until we finish
+            var c = await _context.Classes
+                .FromSqlRaw("SELECT * FROM \"Classes\" WHERE \"Id\" = {0} FOR UPDATE", classId)
+                .Include(x => x.Holds)
+                .FirstOrDefaultAsync();
+
             if (c == null) return NotFound(new { message = "Class not found." });
 
-            ExpireOldHolds();
+            await ExpireOldHoldsAsync();
 
             var existingActiveHold = c.Holds.FirstOrDefault(h => h.StudentId == studentId && 
                 (h.Status == HoldStatus.HELD && h.ExpiresAt > DateTime.UtcNow || h.Status == HoldStatus.CONFIRMED));
@@ -53,7 +57,9 @@ public class HoldsController : ControllerBase
             };
 
             _context.Holds.Add(hold);
-            _context.SaveChanges();
+            await _context.SaveChangesAsync();
+            
+            await transaction.CommitAsync();
 
             return StatusCode(201, new
             {
@@ -64,13 +70,18 @@ public class HoldsController : ControllerBase
                 expiresAt = hold.ExpiresAt
             });
         }
+        catch (Exception)
+        {
+            await transaction.RollbackAsync();
+            return StatusCode(500, new { message = "An error occurred while processing the request." });
+        }
     }
 
-    // 5. GET /holds/{holdId} (Get hold status)
+    // 5. GET /holds/{holdId}
     [HttpGet("holds/{holdId}")]
     public async Task<IActionResult> GetHold(string holdId)
     {
-        ExpireOldHolds();
+        await ExpireOldHoldsAsync();
         var hold = await _context.Holds.FindAsync(holdId);
         if (hold == null) return NotFound(new { message = "Hold not found." });
 
@@ -83,16 +94,17 @@ public class HoldsController : ControllerBase
         });
     }
 
-    // 6. POST /holds/{holdId}/confirm (Confirm the hold)
+    // 6. POST /holds/{holdId}/confirm
     [HttpPost("holds/{holdId}/confirm")]
     public async Task<IActionResult> ConfirmHold(string holdId, [FromHeader(Name = "X-Student-Id")] string studentId)
     {
         if (string.IsNullOrEmpty(studentId)) return BadRequest(new { message = "X-Student-Id header is required." });
 
-        lock (_lock)
+        using var transaction = await _context.Database.BeginTransactionAsync();
+        try
         {
-            ExpireOldHolds();
-            var hold = _context.Holds.FirstOrDefault(h => h.Id == holdId);
+            await ExpireOldHoldsAsync();
+            var hold = await _context.Holds.FirstOrDefaultAsync(h => h.Id == holdId);
             
             if (hold == null) return NotFound(new { message = "Hold not found." });
             if (hold.StudentId != studentId) return Unauthorized(new { message = "You do not own this hold." });
@@ -101,7 +113,8 @@ public class HoldsController : ControllerBase
             if (hold.Status == HoldStatus.EXPIRED || hold.ExpiresAt <= DateTime.UtcNow)
             {
                 hold.Status = HoldStatus.EXPIRED;
-                _context.SaveChanges();
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
                 return BadRequest(new { message = "Hold has expired." });
             }
 
@@ -109,41 +122,43 @@ public class HoldsController : ControllerBase
                 return BadRequest(new { message = "Hold was cancelled." });
 
             hold.Status = HoldStatus.CONFIRMED;
-            _context.SaveChanges();
-
+            await _context.SaveChangesAsync();
+            
+            await transaction.CommitAsync();
             return Ok(new { holdId = hold.Id, status = "CONFIRMED" });
+        }
+        catch (Exception)
+        {
+            await transaction.RollbackAsync();
+            return StatusCode(500, new { message = "An error occurred." });
         }
     }
 
-    // 7. DELETE /holds/{holdId} (Cancel hold)
+    // 7. DELETE /holds/{holdId}
     [HttpDelete("holds/{holdId}")]
     public async Task<IActionResult> CancelHold(string holdId, [FromHeader(Name = "X-Student-Id")] string studentId)
     {
         if (string.IsNullOrEmpty(studentId)) return BadRequest(new { message = "X-Student-Id header is required." });
 
-        lock (_lock)
-        {
-            var hold = _context.Holds.FirstOrDefault(h => h.Id == holdId);
-            
-            if (hold == null) return NotFound(new { message = "Hold not found." });
-            if (hold.StudentId != studentId) return Unauthorized(new { message = "You do not own this hold." });
+        var hold = await _context.Holds.FirstOrDefaultAsync(h => h.Id == holdId);
+        if (hold == null) return NotFound(new { message = "Hold not found." });
+        if (hold.StudentId != studentId) return Unauthorized(new { message = "You do not own this hold." });
 
-            if (hold.Status == HoldStatus.HELD)
-            {
-                hold.Status = HoldStatus.CANCELLED;
-                _context.SaveChanges();
-            }
-            return NoContent();
+        if (hold.Status == HoldStatus.HELD)
+        {
+            hold.Status = HoldStatus.CANCELLED;
+            await _context.SaveChangesAsync();
         }
+        return NoContent();
     }
 
-    // 8. GET /me/holds (Get all holds for a student)
+    // 8. GET /me/holds
     [HttpGet("me/holds")]
     public async Task<IActionResult> GetMyHolds([FromHeader(Name = "X-Student-Id")] string studentId)
     {
         if (string.IsNullOrEmpty(studentId)) return BadRequest(new { message = "X-Student-Id header is required." });
 
-        ExpireOldHolds();
+        await ExpireOldHoldsAsync();
         var holds = await _context.Holds
             .Include(h => h.Class)
             .Where(h => h.StudentId == studentId)
@@ -160,12 +175,11 @@ public class HoldsController : ControllerBase
         return Ok(holds);
     }
 
-    // Helper method to automatically expire holds
-    private void ExpireOldHolds()
+    private async Task ExpireOldHoldsAsync()
     {
-        var expiredHolds = _context.Holds
+        var expiredHolds = await _context.Holds
             .Where(h => h.Status == HoldStatus.HELD && h.ExpiresAt <= DateTime.UtcNow)
-            .ToList();
+            .ToListAsync();
 
         if (expiredHolds.Any())
         {
@@ -173,7 +187,7 @@ public class HoldsController : ControllerBase
             {
                 hold.Status = HoldStatus.EXPIRED;
             }
-            _context.SaveChanges();
+            await _context.SaveChangesAsync();
         }
     }
 }
